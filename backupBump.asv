@@ -1,0 +1,161 @@
+function [dataStore] = backupBump(Robot, maxTime)
+% backupBump – drive forward, back‑up on bump, localise with PF, and plot particles/truth
+%
+% USAGE: backupBump(simRobot, 300);
+
+if nargin < 1
+    disp('ERROR: TCP/IP port object not provided.');
+    return;
+elseif nargin < 2
+    maxTime = 500;
+end
+
+try 
+    CreatePort=Robot.CreatePort;
+catch
+    CreatePort = Robot;
+end
+
+global dataStore;
+
+load('practicemap2025update.mat');
+
+dataStore = struct('truthPose',[], 'odometry',[], 'rsdepth',[], 'bump',[], 'beacon',[]);
+
+SetFwdVelAngVelCreate(Robot,0,0);
+
+numParticles = 1000;
+
+isInitialized = false;
+LoopComplete = false;
+
+persistent initTimer locTimer hFig tPlot
+if isempty(tPlot), tPlot = tic; end
+
+sensorOrigin = [0, 0.08];  
+angles = linspace(-27*pi/180, 27*pi/180, 9)';
+
+tic;  % main timer
+while toc < maxTime
+    [~,dataStore] = readStoreSensorData(Robot,0,dataStore);
+
+    if ~isInitialized
+        % Initialization sequence
+        LoopTimer = tic;
+        elapsedInit = toc(LoopTimer);
+
+        if elapsedInit <= 2
+            SetFwdVelAngVelCreate(Robot, 0.1, 0.1);
+        elseif elapsedInit <= 2 + pi/0.5
+            SetFwdVelAngVelCreate(Robot, 0, 0.5);
+        elseif elapsedInit <= 4 + pi/0.5
+            SetFwdVelAngVelCreate(Robot, 0.1, -0.1);
+        elseif elapsedInit <= 4 + 2*pi/0.5
+            SetFwdVelAngVelCreate(Robot, 0, 0.5);
+        else
+            SetFwdVelAngVelCreate(Robot, 0, 0);
+            stop(LoopTimer);
+            LoopComplete = true;
+            disp('Loop Complete');
+        end
+    end
+
+        dataStore = particleFilterUpdate(Robot, dataStore, numParticles, map, beaconLoc, optWalls, waypoints);
+
+    if LoopComplete
+        if isempty(dataStore.truthPose) || isempty(dataStore.rsdepth)
+            continue; % Ensure data exists
+        end
+
+        predictedDepth = depthPredict(dataStore.truthPose(end, 2:4)', map, sensorOrigin, angles);
+        actualDepth = dataStore.rsdepth(end, 3:11)';
+
+        depthError = norm(predictedDepth - actualDepth);
+        depthThreshold = 0.2;
+
+        if depthError <= depthThreshold
+            isInitialized = true;
+            disp('Robot is localized. Resetting odometry and particles.');
+
+            localizedPose = dataStore.truthPose(end, 2:4);
+
+            dataStore.odometry = [];
+            dataStore.truthPose = [];
+            dataStore.rsdepth = [];
+
+            dataStore = initializeParticlesB(dataStore, map, numParticles, optWalls, localizedPose(1:2), 0.1);
+            for k = 1:numel(dataStore.particles)
+                dataStore.particles(k).theta = wrapToPi(localizedPose(3) + 0.1*randn);
+            end
+        else
+            SetFwdVelAngVelCreate(Robot, 0, 0.5);
+            pause (pi/(2*0.5));
+            SetFwdVelAngVelCreate(Robot, 0, 0);
+            disp('Not Localized looping again');
+            LoopComplete = false;
+            dataStore = initializeParticles(dataStore, map, numParticles, optWalls, waypoints)
+        end
+
+        dataStore = particleFilterUpdate(Robot, dataStore, numParticles, map, beaconLoc, optWalls, waypoints);
+
+    else
+        disp('Normal particle filter operation ongoing...');
+        dataStore = particleFilterUpdate(Robot, dataStore, numParticles, map, beaconLoc, optWalls, waypoints);
+    end
+
+    % --- Teleportation Correction ---
+    if size(dataStore.truthPose,1) > 3
+        prevPose = dataStore.truthPose(end-1,2:4);  % Previous truth [x y theta]
+        currPos  = dataStore.truthPose(end,  2:3);  % Current truth [x y]
+    
+        if norm(currPos - prevPose(1:2)) > 0.6  % Teleportation threshold (0.6 m)
+            disp('Teleportation detected, correcting particle filter position.');
+    
+            % Latest odometry increment [dDist dTheta]
+            odo = dataStore.odometry(end,2:3);
+            d   = odo(1);
+            dth = odo(2);
+    
+            % Compute corrected center based on previous pose and odometry
+            centerX = prevPose(1) + d * cos(prevPose(3));
+            centerY = prevPose(2) + d * sin(prevPose(3));
+            thetaNew = wrapToPi(prevPose(3) + dth);
+    
+            % Update current truthPose with corrected estimate
+            dataStore.truthPose(end, 2:4) = [centerX centerY thetaNew];
+    
+            % Re-initialize PF around corrected center
+            dataStore = initializeParticlesB(dataStore, map, numParticles, optWalls, [centerX centerY], 0.3);
+            for k = 1:numel(dataStore.particles)
+                dataStore.particles(k).theta = wrapToPi(thetaNew + 0.3*randn);
+            end
+        end
+    end
+
+
+    if toc(tPlot) > 0.1
+        figure(hFig); clf;
+        plotParticleFilter(dataStore, map);
+        tPlot = tic;
+    end
+end
+
+SetFwdVelAngVelCreate(Robot,0,0);
+end
+
+function plotParticleFilter(ds,map)
+if ~isfield(ds,'particles') || isempty(ds.particles), return; end
+hold on; axis equal; xlabel('x [m]'); ylabel('y [m]');
+for i = 1:size(map,1)
+    plot(map(i,[1 3]), map(i,[2 4]), 'k-');
+end
+scatter([ds.particles.x],[ds.particles.y],12,[ds.particles.weight],'filled');
+if ~isempty(ds.truthPose)
+    tr = ds.truthPose;
+    plot(tr(:,2),tr(:,3),'r-','LineWidth',1.2);
+    quiver(tr(end,2),tr(end,3),0.2*cos(tr(end,4)),0.2*sin(tr(end,4)),'r','LineWidth',1,'MaxHeadSize',2);
+end
+title('Particle Filter Debug');
+hold off;
+drawnow;
+end
